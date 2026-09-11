@@ -12,10 +12,28 @@
 # Features:
 #   - Automatic battery protection on severe weather alerts (DPC)
 #   - Maintenance discharge (keeps inverter + basic loads alive)
+#   - Protection mode after charging, with hysteresis (no ping-pong)
+#   - Adaptive discharge driven by real PV production
 #   - Blackout detection via grid voltage monitoring
 #   - Off-peak night charging with weather-based SOC targets
 #   - Telegram + Alexa notifications with unified DND
 #   - Fully configurable via apps.yaml (no hardcoded entities)
+#
+# Changelog v2.3:
+#   - Maintenance discharge adjustable from the dashboard
+#     (input_number.storm_shield_maintenance_discharge, default 2000W):
+#     on a sudden blackout HA has no time to react, with 2000W the
+#     house (and the HA server) stays powered
+#   - Optional save/restore of battery SOC limits around forced charge
+#
+# Changelog v2.2:
+#   - Protection state after charging with configurable hysteresis:
+#     recharge only when SOC drops below (target - hysteresis)
+#   - Real PV power vs forecast: discharge released while PV produces,
+#     grid charge postponed when panels produce despite a bad forecast
+#   - DPC level = highest of today/tomorrow; unavailable sensor handled
+#   - Stale runtime flags reset at startup
+#   - No forced charge when less than 500W of headroom is available
 
 import appdaemon.plugins.hass.hassapi as hass
 import urllib.request
@@ -25,7 +43,7 @@ from datetime import datetime, timedelta, time
 
 class StormShield(hass.Hass):
 
-    VERSION = "2.1"
+    VERSION = "2.3"
 
     # ═════════════════════════════════════════════════════════════
     # INIT
@@ -74,6 +92,7 @@ class StormShield(hass.Hass):
         self.sensor_sunset = self.args.get("sensor_sunset", "")
         self.sensor_weather = self.args.get("sensor_weather", "")
         self.sensor_forecast = self.args.get("sensor_forecast", "")
+        self.sensor_pv_power = self.args.get("sensor_pv_power", "")
         self.ev_charger = self.args.get("ev_charger", "")
 
         # ─── Blackout thresholds (V) ───
@@ -83,8 +102,10 @@ class StormShield(hass.Hass):
             "grid_voltage_restore", 200))
 
         # ─── Power thresholds (W) ───
+        # discharge_maintenance is only a fallback: the dashboard helper
+        # input_number.storm_shield_maintenance_discharge wins (v2.3)
         self.discharge_maintenance = int(self.args.get(
-            "discharge_maintenance", 500))
+            "discharge_maintenance", 2000))
         self.discharge_blackout = int(self.args.get(
             "discharge_blackout", 5000))
 
@@ -102,18 +123,31 @@ class StormShield(hass.Hass):
         self.inverter_device_id = self.args.get(
             "inverter_device_id", "")
 
+        # ─── Battery SOC limits (optional, v2.3) ───
+        # Saved before a forced charge and restored after it, for
+        # inverters that reset them when forced charging starts.
+        self.backup_soc_entity = self.args.get("backup_soc_entity", "")
+        self.end_of_discharge_soc_entity = self.args.get(
+            "end_of_discharge_soc_entity", "")
+        self._saved_backup_soc = None
+        self._saved_eod_soc = None
+
         # ─── Storm Shield helper entity IDs ───
         pfx_bool = "input_boolean.storm_shield_"
         pfx_num = "input_number.storm_shield_"
         self.h_contract = f"{pfx_num}contract_power"
         self.h_margin = f"{pfx_num}safety_margin"
         self.h_max_charge = f"{pfx_num}max_charge_power"
+        self.h_maintenance_discharge = f"{pfx_num}maintenance_discharge"
         self.h_discharge_restore = f"{pfx_num}discharge_restore"
         self.h_target_soc = f"{pfx_num}target_soc"
+        self.h_hysteresis = f"{pfx_num}hysteresis"
+        self.h_pv_threshold = f"{pfx_num}pv_threshold"
         self.h_active = f"{pfx_bool}active"
         self.h_manual = f"{pfx_bool}manual"
         self.h_bypass = f"{pfx_bool}bypass"
         self.h_charging = f"{pfx_bool}charging"
+        self.h_protection = f"{pfx_bool}protection"
         self.h_dnd = f"{pfx_bool}dnd"
         self.h_notify_alexa = f"{pfx_bool}notify_alexa"
         self.h_notify_tg = f"{pfx_bool}notify_telegram"
@@ -131,8 +165,10 @@ class StormShield(hass.Hass):
         # ─── Internal state ───
         self.charge_monitor_timer = None
         self.f3_monitor_timer = None
+        self.protection_monitor_timer = None
         self._log_entries = []
         self._blackout_active = False
+        self._pv_high_since = None  # since when real PV is above threshold
 
         # ─── Schedule: hourly alert check at :01 ───
         self.run_hourly(self._hourly_check, time(0, 1, 0))
@@ -146,6 +182,18 @@ class StormShield(hass.Hass):
         if f3_end:
             self.run_daily(self._f3_stop_cb, f3_end)
             self.log(f"  🌙 Night charge stop:  {f3_end.strftime('%H:%M')}")
+
+        # ─── Reset stale runtime flags (HA restores the last state,
+        #     but timers are lost on restart) ───
+        for entity in (self.h_charging, self.h_f3_charging,
+                       self.h_protection, self.h_blackout):
+            try:
+                if self.get_state(entity) == "on":
+                    self.call_service("input_boolean/turn_off",
+                                      entity_id=entity)
+                    self.log(f"  🔄 Reset: {entity} → off")
+            except Exception:
+                pass
 
         # ─── Listeners ───
         self.listen_state(self._on_manual_toggle, self.h_manual)
@@ -179,11 +227,13 @@ class StormShield(hass.Hass):
                  f"{self.sensor_sunset or 'disabled'}")
         self.log(f"  📊 Weather:        "
                  f"{self.sensor_weather or 'disabled'}")
+        self.log(f"  📊 PV power:       "
+                 f"{self.sensor_pv_power or 'disabled'}")
         self.log(f"  📊 EV charger:     "
                  f"{self.ev_charger or 'disabled'}")
         self.log(f"  🔋 Discharge ctrl: {self.discharge_entity}")
         self.log(f"  🔋 Charge switch:  {self.charge_switch}")
-        self.log(f"  ⚡ Maintenance:    {self.discharge_maintenance}W")
+        self.log(f"  ⚡ Maintenance:    {self._maintenance_w()}W")
         self.log(f"  ⚡ Blackout:       {self.discharge_blackout}W")
         self.log(f"  📢 Telegram:       "
                  f"{'enabled' if self.telegram_bot_token else 'disabled'}")
@@ -196,6 +246,8 @@ class StormShield(hass.Hass):
             self.log(f"  🔌 Inverter:       direct ({self.charge_service})")
         else:
             self.log(f"  🔌 Inverter:       via HA automations (no device_id)")
+        if self.backup_soc_entity or self.end_of_discharge_soc_entity:
+            self.log("  💾 SOC limits:     saved/restored around forced charge")
 
     # ═════════════════════════════════════════════════════════════
     # LOGGING
@@ -234,6 +286,17 @@ class StormShield(hass.Hass):
     # ═════════════════════════════════════════════════════════════
     # UTILITY
     # ═════════════════════════════════════════════════════════════
+
+    def _maintenance_w(self):
+        """Maintenance discharge (W): dashboard helper, else apps.yaml."""
+        return int(self._num(self.h_maintenance_discharge,
+                             self.discharge_maintenance))
+
+    def _pv_real(self):
+        """Live PV production (W), 0 if no PV sensor is configured."""
+        if not self.sensor_pv_power:
+            return 0.0
+        return self._num(self.sensor_pv_power, 0)
 
     def _num(self, entity_id, default=0):
         try:
@@ -281,11 +344,13 @@ class StormShield(hass.Hass):
 
         is_active = self.get_state(self.h_active) == "on"
         is_manual = self.get_state(self.h_manual) == "on"
+        is_protection = self.get_state(self.h_protection) == "on"
         level, source, info = self._get_alert_level()
         soc = self._num(self.sensor_soc, 0)
 
-        self._action(f"📊 Alert: {level} ({source}) | "
-                     f"SOC: {soc}% | Active: {is_active}")
+        self._action(f"📊 DPC: lv.{level} ({source}: {info}) | "
+                     f"SOC: {soc}% | Active: {is_active} | "
+                     f"Protected: {is_protection}")
 
         is_critical = level in (3, 4)
 
@@ -310,20 +375,34 @@ class StormShield(hass.Hass):
         if self.get_state(self.h_test_mode) == "on":
             lv = int(max(0, min(4, self._num(self.h_test_level, 0))))
             return (lv, "test", f"Simulated level {lv}")
+        dpc_state = self.get_state(self.sensor_dpc)
+        if dpc_state in ("unavailable", "unknown", None):
+            self.log(f"⚠️ DPC sensor: {dpc_state}", level="WARNING")
+            return (0, "N/A", f"DPC sensor: {dpc_state}")
+
+        # v2.2: use the highest level between today and tomorrow
+        level_tomorrow, info_tomorrow = 0, "N/A"
+        level_today, info_today = 0, "N/A"
         try:
             tomorrow = self.get_state(self.sensor_dpc,
                                       attribute="tomorrow")
             if (tomorrow and isinstance(tomorrow, dict)
                     and "level" in tomorrow):
-                lv = int(max(0, min(4, int(tomorrow["level"]))))
-                return (lv, "tomorrow", tomorrow.get("info", "N/A"))
+                level_tomorrow = int(max(0, min(4, int(tomorrow["level"]))))
+                info_tomorrow = tomorrow.get("info", "N/A")
             today = self.get_state(self.sensor_dpc, attribute="today")
             if (today and isinstance(today, dict)
                     and "level" in today):
-                lv = int(max(0, min(4, int(today["level"]))))
-                return (lv, "today", today.get("info", "N/A"))
+                level_today = int(max(0, min(4, int(today["level"]))))
+                info_today = today.get("info", "N/A")
         except Exception as e:
             self.log(f"⚠️ DPC: {e}", level="WARNING")
+            return (0, "N/A", "DPC read error")
+
+        if level_tomorrow >= level_today and level_tomorrow > 0:
+            return (level_tomorrow, "tomorrow", info_tomorrow)
+        if level_today > 0:
+            return (level_today, "today", info_today)
         return (0, "N/A", "No data")
 
     def _get_alert_events(self):
@@ -356,7 +435,7 @@ class StormShield(hass.Hass):
     def _activate(self, level, source, info):
         self.call_service("input_boolean/turn_on",
                           entity_id=self.h_active)
-        self._set_discharge(self.discharge_maintenance)
+        self._set_discharge(self._maintenance_w())
 
         soc = self._num(self.sensor_soc, 0)
         target = self._num(self.h_target_soc, 100)
@@ -368,10 +447,11 @@ class StormShield(hass.Hass):
                f"📋 {info}\n📍 {zone}\n🔍 {events}\n"
                f"📅 Source: {source}\n\n"
                f"🔋 Battery: {soc}%\n"
-               f"🔒 Discharge: {self.discharge_maintenance}W")
+               f"🔒 Discharge: {self._maintenance_w()}W")
 
         if soc >= target:
             msg += f"\n✅ SOC already at target ({target:.0f}%)!"
+            self._enter_protection(soc, target)
             self._notify(msg, f"Storm Shield activated. "
                          f"Battery at {soc:.0f} percent.")
         else:
@@ -392,6 +472,12 @@ class StormShield(hass.Hass):
         restore = self._num(self.h_discharge_restore, 5000)
         self._set_discharge(restore)
         self._cancel_monitor()
+        self._cancel_protection_monitor()
+
+        if self.get_state(self.h_protection) == "on":
+            self.call_service("input_boolean/turn_off",
+                              entity_id=self.h_protection)
+        self._pv_high_since = None
 
         if self._blackout_active:
             self._blackout_active = False
@@ -414,6 +500,96 @@ class StormShield(hass.Hass):
                      f"🔓 Discharge: {restore:.0f}W",
                      f"Storm Shield deactivated. "
                      f"Battery at {soc:.0f} percent.")
+
+    # ═════════════════════════════════════════════════════════════
+    # PROTECTION MODE AFTER CHARGING (v2.2, anti ping-pong)
+    # ═════════════════════════════════════════════════════════════
+
+    def _enter_protection(self, soc, target):
+        """Battery at target during an alert: hold it, adapt discharge."""
+        self.call_service("input_boolean/turn_on",
+                          entity_id=self.h_protection)
+        self._pv_high_since = None
+        recharge_at = self._recharge_threshold(target)
+        self._action(f"🛡️ PROTECTION ON: SOC {soc}% (target {target:.0f}%) "
+                     f"| recharge below {recharge_at:.0f}%")
+        self._start_protection_monitor()
+
+    def _exit_protection(self, reason):
+        self.call_service("input_boolean/turn_off",
+                          entity_id=self.h_protection)
+        self._pv_high_since = None
+        self._cancel_protection_monitor()
+        self._action(f"🛡️ PROTECTION OFF: {reason}")
+
+    def _recharge_threshold(self, target):
+        """SOC below which a protected battery is charged again."""
+        hysteresis = self._num(self.h_hysteresis, 15)
+        return max(20, target - hysteresis)
+
+    def _start_protection_monitor(self):
+        """Every 5 minutes: check real PV and SOC."""
+        self._cancel_protection_monitor()
+        self.protection_monitor_timer = self.run_every(
+            self._protection_monitor_cb,
+            self.datetime() + timedelta(seconds=300), 300)
+
+    def _cancel_protection_monitor(self):
+        if self.protection_monitor_timer is not None:
+            try:
+                self.cancel_timer(self.protection_monitor_timer)
+            except Exception:
+                pass
+            self.protection_monitor_timer = None
+
+    def _protection_monitor_cb(self, kwargs):
+        if self.get_state(self.h_protection) != "on":
+            self._cancel_protection_monitor()
+            return
+        if self.get_state(self.h_active) != "on":
+            self._exit_protection("Storm Shield no longer active")
+            return
+        self._update_protection_discharge()
+
+    def _update_protection_discharge(self):
+        """Adaptive discharge while protected, driven by real PV."""
+        if self.get_state(self.h_protection) != "on":
+            return
+        if self._blackout_active:
+            return
+
+        pv_power = self._pv_real()
+        pv_threshold = self._num(self.h_pv_threshold, 500)
+        soc = self._num(self.sensor_soc, 0)
+        target = self._num(self.h_target_soc, 100)
+        recharge_at = self._recharge_threshold(target)
+        restore = self._num(self.h_discharge_restore, 5000)
+
+        import time as _time
+        now_ts = _time.time()
+
+        if self.sensor_pv_power and pv_power > pv_threshold:
+            if self._pv_high_since is None:
+                self._pv_high_since = now_ts
+                self._action(f"☀️ Real PV {pv_power:.0f}W > "
+                             f"{pv_threshold:.0f}W: watching")
+            elif (now_ts - self._pv_high_since) >= 900:  # 15 minutes
+                self._set_discharge(restore)
+                self._action(f"☀️ Real PV {pv_power:.0f}W stable "
+                             f"for 15 min → discharge {restore:.0f}W")
+        else:
+            if self._pv_high_since is not None:
+                self._action(f"🌧️ Real PV {pv_power:.0f}W < "
+                             f"{pv_threshold:.0f}W → maintenance")
+            self._pv_high_since = None
+            self._set_discharge(self._maintenance_w())
+
+        if soc < recharge_at:
+            self._exit_protection(
+                f"SOC {soc}% < hysteresis threshold {recharge_at:.0f}%")
+            pv_ok, detail = self._evaluate_pv()
+            if not pv_ok and pv_power < pv_threshold:
+                self._start_charging()
 
     # ═════════════════════════════════════════════════════════════
     # BLACKOUT DETECTION (grid voltage)
@@ -457,15 +633,15 @@ class StormShield(hass.Hass):
                                   entity_id=self.h_blackout)
             except Exception:
                 pass
-            self._set_discharge(self.discharge_maintenance)
+            self._set_discharge(self._maintenance_w())
             soc = self._num(self.sensor_soc, 0)
             self._action(f"✅ Grid OK! Voltage: {voltage:.0f}V → "
-                         f"discharge {self.discharge_maintenance}W")
+                         f"discharge {self._maintenance_w()}W")
             self._notify(
                 f"🛡️ *STORM SHIELD — GRID RESTORED*\n\n"
                 f"✅ Grid voltage: *{voltage:.0f}V*\n"
                 f"🔋 Battery: {soc}%\n"
-                f"🔒 Discharge: {self.discharge_maintenance}W",
+                f"🔒 Discharge: {self._maintenance_w()}W",
                 f"Grid restored. Voltage {voltage:.0f} volts. "
                 f"Battery at {soc:.0f} percent.")
 
@@ -572,7 +748,9 @@ class StormShield(hass.Hass):
         margin = self._num(self.h_margin, 500)
         max_ch = self._num(self.h_max_charge, 3000)
         avail = contract - grid - margin
-        return int(max(500, min(avail, max_ch)) / 100) * 100
+        if avail < 500:
+            return 0  # not enough headroom: don't charge
+        return int(min(avail, max_ch) / 100) * 100
 
     def _start_charging(self):
         soc = self._num(self.sensor_soc, 0)
@@ -581,7 +759,16 @@ class StormShield(hass.Hass):
             self._action(f"✅ SOC {soc}% ≥ {target}% — no charge needed")
             return
         power = self._calc_charge_power()
+        if power < 500:
+            self._action(f"⚠️ Not enough power ({power}W): charge postponed")
+            return
         self._action(f"⚡ Charging: {power}W ({soc}%→{target:.0f}%)")
+
+        # Protection is suspended while charging
+        if self.get_state(self.h_protection) == "on":
+            self.call_service("input_boolean/turn_off",
+                              entity_id=self.h_protection)
+            self._cancel_protection_monitor()
 
         self.call_service("input_number/set_value",
                           entity_id=self.target_soc_entity, value=target)
@@ -591,6 +778,7 @@ class StormShield(hass.Hass):
                           entity_id=self.charge_switch)
         self.call_service("input_boolean/turn_on",
                           entity_id=self.h_charging)
+        self._save_soc_limits()
         self._inverter_charge(target, power)
         self._start_monitor()
 
@@ -602,6 +790,7 @@ class StormShield(hass.Hass):
     def _stop_charging(self):
         self._action("🔌 Charging stopped")
         self._inverter_stop()
+        self.run_in(self._delayed_restore_soc, 5)
         self.call_service("input_boolean/turn_off",
                           entity_id=self.charge_switch)
         self.call_service("input_boolean/turn_off",
@@ -609,15 +798,30 @@ class StormShield(hass.Hass):
         self._cancel_monitor()
 
     def _check_charge_needed(self):
+        """Alert still active: charge, protect, or wait for PV."""
         if self.get_state(self.h_charging) == "on":
             return
         soc = self._num(self.sensor_soc, 0)
         target = self._num(self.h_target_soc, 100)
-        if soc >= target:
+
+        if self.get_state(self.h_protection) == "on":
+            self._update_protection_discharge()
             return
+
+        if soc >= target:
+            self._enter_protection(soc, target)
+            return
+
         pv_ok, detail = self._evaluate_pv()
         if not pv_ok:
-            self._action(f"⚡ No PV ({detail}), SOC {soc}%<{target:.0f}%")
+            pv_real = self._pv_real()
+            pv_thr = self._num(self.h_pv_threshold, 500)
+            if self.sensor_pv_power and pv_real > pv_thr:
+                self._action(f"☀️ Bad forecast ({detail}) but real PV "
+                             f"{pv_real:.0f}W > {pv_thr:.0f}W: waiting")
+                return
+            self._action(f"⚡ No PV ({detail}), SOC {soc}%<{target:.0f}% "
+                         f"→ grid charge")
             self._start_charging()
 
     # ─── Charge monitor (60s) ───
@@ -645,9 +849,14 @@ class StormShield(hass.Hass):
         if soc >= target:
             self._action(f"✅ Charge complete: {soc}%")
             self._stop_charging()
+            level, _, _ = self._get_alert_level()
+            protect = level in (3, 4)
+            if protect:
+                self._enter_protection(soc, target)
             self._notify(f"🛡️ *STORM SHIELD*\n"
                          f"✅ Battery *{soc:.0f}%*!\n"
-                         f"🔒 Discharge: {self.discharge_maintenance}W",
+                         f"🔒 Discharge: {self._maintenance_w()}W"
+                         + ("\n🛡️ Protection active" if protect else ""),
                          f"Charge complete. Battery at {soc:.0f} percent.")
             return
         new = self._calc_charge_power()
@@ -725,6 +934,10 @@ class StormShield(hass.Hass):
                          f"insufficient power ({power}W)")
             return
 
+        if target <= 0:
+            self._action("🌙 Night charge skip: target SOC = 0%")
+            return
+
         self._action(f"🌙 Night charge: SOC {soc}% → {target:.0f}%")
         self._f3_start_charging(target, power)
 
@@ -738,6 +951,7 @@ class StormShield(hass.Hass):
                           entity_id=self.charge_switch)
         self.call_service("input_boolean/turn_on",
                           entity_id=self.h_f3_charging)
+        self._save_soc_limits()
         self._inverter_charge(target, power)
 
         self._cancel_f3_monitor()
@@ -784,6 +998,7 @@ class StormShield(hass.Hass):
 
     def _f3_stop_charging(self):
         self._inverter_stop()
+        self.run_in(self._delayed_restore_soc, 5)
         self.call_service("input_boolean/turn_off",
                           entity_id=self.charge_switch)
         self.call_service("input_boolean/turn_off",
@@ -813,9 +1028,14 @@ class StormShield(hass.Hass):
             if soc >= target:
                 self._action(f"✅ SOC {soc}% = alert target!")
                 self._stop_charging()
+                level, _, _ = self._get_alert_level()
+                protect = level in (3, 4)
+                if protect:
+                    self._enter_protection(soc, target)
                 self._notify(
                     f"🛡️ *STORM SHIELD*\n✅ {soc:.0f}%!\n"
-                    f"🔒 Discharge: {self.discharge_maintenance}W",
+                    f"🔒 Discharge: {self._maintenance_w()}W"
+                    + ("\n🛡️ Protection active" if protect else ""),
                     f"Target reached. Battery at {soc:.0f} percent.")
 
         if self.get_state(self.h_f3_charging) == "on":
@@ -844,6 +1064,8 @@ class StormShield(hass.Hass):
             return
         if self.get_state(self.h_charging) == "on":
             return
+        if self.get_state(self.h_protection) == "on":
+            return  # already charged and protected
         soc = self._num(self.sensor_soc, 0)
         target = self._num(self.h_target_soc, 100)
         if soc < target:
@@ -879,12 +1101,12 @@ class StormShield(hass.Hass):
             self._action("🔒 MANUAL activation")
             self.call_service("input_boolean/turn_on",
                               entity_id=self.h_active)
-            self._set_discharge(self.discharge_maintenance)
+            self._set_discharge(self._maintenance_w())
             soc = self._num(self.sensor_soc, 0)
             self._notify(
                 f"🛡️ *MANUAL ACTIVATED*\n"
                 f"🔋 {soc}%\n"
-                f"🔒 Discharge: {self.discharge_maintenance}W",
+                f"🔒 Discharge: {self._maintenance_w()}W",
                 f"Storm Shield manual activated. "
                 f"Battery at {soc:.0f} percent.")
             target = self._num(self.h_target_soc, 100)
@@ -957,6 +1179,55 @@ class StormShield(hass.Hass):
             self.log("  🔌 Inverter: stop forced charge")
         except Exception as e:
             self.log(f"⚠️ Inverter stop: {e}", level="WARNING")
+
+    # ─── Battery SOC limits (optional, v2.3) ───
+
+    def _save_soc_limits(self):
+        """Save battery SOC limits before a forced charge."""
+        if (self._saved_backup_soc is not None
+                or self._saved_eod_soc is not None):
+            return  # already saved: don't overwrite with post-reset values
+        try:
+            if self.backup_soc_entity:
+                backup = self._num(self.backup_soc_entity, None)
+                if backup is not None and backup > 0:
+                    self._saved_backup_soc = backup
+            if self.end_of_discharge_soc_entity:
+                eod = self._num(self.end_of_discharge_soc_entity, None)
+                if eod is not None and eod > 0:
+                    self._saved_eod_soc = eod
+            if self._saved_backup_soc or self._saved_eod_soc:
+                self.log(f"  💾 SOC limits saved: "
+                         f"backup={self._saved_backup_soc}% "
+                         f"eod={self._saved_eod_soc}%")
+        except Exception as e:
+            self.log(f"⚠️ Save SOC limits: {e}", level="WARNING")
+
+    def _delayed_restore_soc(self, kwargs):
+        self._restore_soc_limits()
+
+    def _restore_soc_limits(self):
+        """Restore battery SOC limits after a forced charge."""
+        try:
+            restored = False
+            if self._saved_backup_soc is not None:
+                self.call_service("number/set_value",
+                                  entity_id=self.backup_soc_entity,
+                                  value=self._saved_backup_soc)
+                restored = True
+            if self._saved_eod_soc is not None:
+                self.call_service("number/set_value",
+                                  entity_id=self.end_of_discharge_soc_entity,
+                                  value=self._saved_eod_soc)
+                restored = True
+            if restored:
+                self._action(f"💾 SOC limits restored: "
+                             f"backup={self._saved_backup_soc}% "
+                             f"eod={self._saved_eod_soc}%")
+            self._saved_backup_soc = None
+            self._saved_eod_soc = None
+        except Exception as e:
+            self.log(f"⚠️ Restore SOC limits: {e}", level="WARNING")
 
     # ═════════════════════════════════════════════════════════════
     # NOTIFICATIONS (unified v2.1)

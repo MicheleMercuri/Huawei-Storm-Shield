@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              🛡️  STORM SHIELD  — v2.1                      ║
+# ║              🛡️  STORM SHIELD  — v2.3                      ║
 # ║    Package Home Assistant — Helper + Template Sensors       ║
 # ║    Protezione allerta + Carica Notturna + Blackout          ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -9,6 +9,7 @@
 #   - YOUR_SUNSET_SENSOR   → your sun setting sensor
 #   - YOUR_FORECAST_SENSOR → your weather forecast sensor
 #   - YOUR_WEATHER_ENTITY  → your weather entity
+#   - YOUR_PV_POWER_SENSOR → your live PV production sensor (W)
 #
 #   The template sensors (PV Available, Charge Power) use these.
 #   If you don't have PV/weather sensors, you can delete the
@@ -37,6 +38,11 @@ input_boolean:
   storm_shield_charging:
     name: "Storm Shield Carica Rete"
     icon: mdi:battery-charging-high
+    initial: false
+
+  storm_shield_protection:
+    name: "Storm Shield Protetto"
+    icon: mdi:shield-check
     initial: false
 
   storm_shield_blackout:
@@ -110,6 +116,16 @@ input_number:
     unit_of_measurement: "W"
     mode: box
 
+  storm_shield_maintenance_discharge:
+    name: "Scarica mantenimento allerta"
+    icon: mdi:battery-minus
+    min: 500
+    max: 3000
+    step: 100
+    initial: 2000
+    unit_of_measurement: "W"
+    mode: box
+
   storm_shield_discharge_restore:
     name: "Potenza scarica ripristino"
     icon: mdi:battery-arrow-down
@@ -128,6 +144,26 @@ input_number:
     step: 5
     initial: 100
     unit_of_measurement: "%"
+    mode: slider
+
+  storm_shield_hysteresis:
+    name: "Isteresi anti-rimbalzo"
+    icon: mdi:swap-vertical
+    min: 5
+    max: 30
+    step: 5
+    initial: 15
+    unit_of_measurement: "%"
+    mode: slider
+
+  storm_shield_pv_threshold:
+    name: "Soglia PV reale"
+    icon: mdi:solar-power-variant
+    min: 100
+    max: 2000
+    step: 100
+    initial: 500
+    unit_of_measurement: "W"
     mode: slider
 
   storm_shield_test_level:
@@ -212,6 +248,7 @@ template:
         state: >-
           {% set active = is_state('input_boolean.storm_shield_active', 'on') %}
           {% set charging = is_state('input_boolean.storm_shield_charging', 'on') %}
+          {% set protection = is_state('input_boolean.storm_shield_protection', 'on') %}
           {% set f3 = is_state('input_boolean.storm_shield_f3_charging', 'on') %}
           {% set bypass = is_state('input_boolean.storm_shield_bypass', 'on') %}
           {% set manual = is_state('input_boolean.storm_shield_manual', 'on') %}
@@ -222,6 +259,7 @@ template:
           {% elif blackout %}⚡ BLACKOUT
           {% elif f3 %}🌙 Carica Notturna
           {% elif charging %}⚡ Carica rete
+          {% elif protection %}🛡️ Protetto
           {% elif active and manual %}🔒 Manuale
           {% elif active %}🛡️ Attivo
           {% else %}📡 Monitoraggio{% endif %}
@@ -333,3 +371,17 @@ template:
           {% set max_ch = states('input_number.storm_shield_max_charge_power') | float(3000) %}
           {% set avail = contract - grid - margin %}
           {{ ((([0, [avail, max_ch] | min] | max) / 100) | round(0) * 100) | int }}
+
+      - name: "Storm Shield PV Real"
+        unique_id: storm_shield_pv_real
+        icon: mdi:solar-power-variant
+        unit_of_measurement: "W"
+        state: >-
+          {{ states('sensor.YOUR_PV_POWER_SENSOR') | float(0) | round(0) }}
+        attributes:
+          above_threshold: >-
+            {% set pv = states('sensor.YOUR_PV_POWER_SENSOR') | float(0) %}
+            {% set thr = states('input_number.storm_shield_pv_threshold') | float(500) %}
+            {{ pv > thr }}
+          threshold: >-
+            {{ states('input_number.storm_shield_pv_threshold') | float(500) | round(0) }}

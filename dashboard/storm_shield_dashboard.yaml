@@ -80,12 +80,15 @@ sections:
                   'on') %} {% set f3 =
                   is_state('input_boolean.storm_shield_f3_charging', 'on') %} {%
                   set charging = is_state('input_boolean.storm_shield_charging',
-                  'on') %} {% set soc =
-                  states('sensor.battery_state_of_capacity') | float(0) |
-                  round(0) %} {% if charging %}⚡ Carica rete · 🔋 {{ soc }}% {%
-                  elif f3 %}🌙 Carica Notturna · 🔋 {{ soc }}% {% elif active %}🔒
-                  Protezione · 🔋 {{ soc }}% {% else %}🔋 {{ soc }}% · Scarica
-                  libera{% endif %}
+                  'on') %} {% set protection =
+                  is_state('input_boolean.storm_shield_protection', 'on') %} {%
+                  set soc = states('sensor.battery_state_of_capacity') | float(0)
+                  | round(0) %} {% set pv = states('sensor.input_power') |
+                  float(0) | round(0) %} {% if charging %}⚡ Carica rete · 🔋 {{
+                  soc }}% {% elif f3 %}🌙 Carica Notturna · 🔋 {{ soc }}% {%
+                  elif protection %}🛡️ Protetto · 🔋 {{ soc }}% · ☀️ {{ pv }}W
+                  {% elif active %}🔒 Attivo · 🔋 {{ soc }}% {% else %}🔋 {{ soc
+                  }}% · Scarica libera{% endif %}
                 icon: >-
                   {% set soc = states('sensor.battery_state_of_capacity') |
                   float(0) %} {% set charging =
@@ -123,6 +126,7 @@ sections:
                       {% set active = is_state('input_boolean.storm_shield_active', 'on') %}
                       {% set f3 = is_state('input_boolean.storm_shield_f3_charging', 'on') %}
                       {% set charging = is_state('input_boolean.storm_shield_charging', 'on') %}
+                      {% set protection = is_state('input_boolean.storm_shield_protection', 'on') %}
                       {% set test = is_state('input_boolean.storm_shield_test_mode', 'on') %}
                       {% set level = states('sensor.storm_shield_alert_level') | int(0) %}
 
@@ -134,6 +138,10 @@ sections:
                         --pulse-color: 255,179,0;
                         border: 2px solid rgba(255,179,0,0.8);
                         animation: pulse-card 1.5s ease-in-out infinite;
+                      {% elif protection %}
+                        --pulse-color: 0,150,136;
+                        border: 2px solid rgba(0,150,136,0.8);
+                        animation: pulse-card 3s ease-in-out infinite;
                       {% elif active and level >= 4 %}
                         --pulse-color: 244,67,54;
                         border: 2px solid rgba(244,67,54,0.8);
@@ -306,6 +314,37 @@ sections:
                     !important; }
               - type: custom:mushroom-template-card
                 primary: >-
+                  ☀️ {{ states('sensor.input_power') | float(0) | round(0) }}W
+                secondary: >-
+                  {% set pv = states('sensor.input_power') | float(0) %} {% set
+                  thr = states('input_number.storm_shield_pv_threshold') |
+                  float(500) %} {% if pv > thr %}Sopra soglia ✅{% else %}Sotto
+                  soglia{% endif %}
+                icon: mdi:solar-power-variant
+                color: >-
+                  {% set pv = states('sensor.input_power') | float(0) %} {% set
+                  thr = states('input_number.storm_shield_pv_threshold') |
+                  float(500) %} {% if pv > thr %}amber{% elif pv > 100
+                  %}light-green{% else %}grey{% endif %}
+                vertical: true
+                features_position: bottom
+                card_mod:
+                  style: >
+                    ha-card {
+                      {% set pv = states('sensor.input_power') | float(0) %}
+                      {% set thr = states('input_number.storm_shield_pv_threshold') | float(500) %}
+                      {% if pv > thr %}
+                        background: linear-gradient(145deg, rgba(255,193,7,0.25), rgba(255,152,0,0.15));
+                        border: 1px solid rgba(255,193,7,0.5);
+                      {% else %}
+                        background: linear-gradient(145deg, rgba(100,100,100,0.15), rgba(80,80,80,0.10));
+                        border: 1px solid rgba(100,100,100,0.3);
+                      {% endif %}
+                      border-radius: 20px; --icon-size: 42px;
+                    }
+                    .primary { font-size: 16px !important; font-weight: 700 !important; }
+              - type: custom:mushroom-template-card
+                primary: >-
                   {% set v = states('sensor.grid_voltage') | float(0) %}
                   {% if v < 100 %}⚡ BLACKOUT
                   {% elif v < 210 %}⚠️ {{ v | round(0) }}V
@@ -445,6 +484,21 @@ sections:
                     rgba(100,100,100,0.3);{% endif %} border-radius: 16px; }
                     @keyframes pulse-ch { 0%,100% { box-shadow: none; } 50% {
                     box-shadow: 0 0 15px rgba(76,175,80,0.4); } }
+              - type: custom:mushroom-entity-card
+                entity: input_boolean.storm_shield_protection
+                name: Protetto
+                icon: mdi:shield-check
+                layout: vertical
+                card_mod:
+                  style: >
+                    ha-card { {% if
+                    is_state('input_boolean.storm_shield_protection', 'on')
+                    %}background: rgba(0,150,136,0.15); border: 1px solid
+                    rgba(0,150,136,0.5); animation: pulse-prot 3s infinite; {%
+                    else %}background: rgba(50,50,50,0.3); border: 1px solid
+                    rgba(100,100,100,0.3);{% endif %} border-radius: 16px; }
+                    @keyframes pulse-prot { 0%,100% { box-shadow: none; } 50% {
+                    box-shadow: 0 0 15px rgba(0,150,136,0.4); } }
           - type: custom:mushroom-number-card
             entity: input_number.storm_shield_target_soc
             name: SOC Target allerta
@@ -454,6 +508,33 @@ sections:
               style: >-
                 ha-card { background: rgba(76,175,80,0.08); border: 1px solid
                 rgba(76,175,80,0.25); border-radius: 16px; }
+          - type: custom:mushroom-number-card
+            entity: input_number.storm_shield_hysteresis
+            name: Isteresi anti-rimbalzo
+            icon: mdi:swap-vertical
+            layout: horizontal
+            card_mod:
+              style: >-
+                ha-card { background: rgba(0,150,136,0.08); border: 1px solid
+                rgba(0,150,136,0.25); border-radius: 16px; }
+          - type: custom:mushroom-number-card
+            entity: input_number.storm_shield_pv_threshold
+            name: Soglia PV reale
+            icon: mdi:solar-power-variant
+            layout: horizontal
+            card_mod:
+              style: >-
+                ha-card { background: rgba(255,193,7,0.08); border: 1px solid
+                rgba(255,193,7,0.25); border-radius: 16px; }
+          - type: custom:mushroom-number-card
+            entity: input_number.storm_shield_maintenance_discharge
+            name: Scarica mantenimento
+            icon: mdi:battery-minus
+            layout: horizontal
+            card_mod:
+              style: >-
+                ha-card { background: rgba(255,152,0,0.08); border: 1px solid
+                rgba(255,152,0,0.25); border-radius: 16px; }
           - type: custom:mushroom-number-card
             entity: input_number.storm_shield_contract_power
             name: Pot. contrattuale
@@ -608,6 +689,7 @@ sections:
             entities:
               - input_boolean.storm_shield_active
               - input_boolean.storm_shield_charging
+              - input_boolean.storm_shield_protection
               - input_boolean.storm_shield_f3_charging
               - input_boolean.storm_shield_manual
               - input_boolean.storm_shield_blackout

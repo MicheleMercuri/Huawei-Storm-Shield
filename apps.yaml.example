@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# STORM SHIELD v2.1 — AppDaemon Configuration
+# STORM SHIELD v2.3 — AppDaemon Configuration
 # ═══════════════════════════════════════════════════════════════
 #
 # Copy this file to your AppDaemon apps/ folder and rename to:
@@ -80,7 +80,9 @@ storm_shield:
 
   # ─── POWER THRESHOLDS [OPTIONAL] ───────────────────────────
   # Override defaults (Watts)
-  # discharge_maintenance: 500   # W during alert (keeps basic loads)
+  # discharge_maintenance is only a fallback: since v2.3 the dashboard
+  # helper input_number.storm_shield_maintenance_discharge wins.
+  # discharge_maintenance: 2000  # W during alert (keeps the house on)
   # discharge_blackout: 5000     # W during blackout (full inverter)
 
   # ─── WEATHER / PV SENSORS [OPTIONAL] ───────────────────────
@@ -90,6 +92,23 @@ storm_shield:
   # sensor_sunset: "sensor.your_city_sun_setting"
   # sensor_weather: "weather.your_weather_provider"
   # sensor_forecast: "sensor.your_forecast_daily"
+
+  # ─── REAL PV POWER [OPTIONAL, v2.2] ────────────────────────
+  # Live PV production (W). While protected, if PV stays above the
+  # threshold (input_number.storm_shield_pv_threshold) for 15 min the
+  # discharge is released; if the forecast says "no sun" but the panels
+  # are producing, grid charging is postponed.
+  # Omit to always rely on the forecast.
+  #
+  # sensor_pv_power: "sensor.input_power"
+
+  # ─── BATTERY SOC LIMITS [OPTIONAL, v2.3] ───────────────────
+  # Some inverters reset backup / end-of-discharge SOC when a forced
+  # charge starts. Storm Shield saves them before charging and restores
+  # them 5 seconds after the charge stops. Huawei Solar example:
+  #
+  # backup_soc_entity: "number.batteries_backup_power_soc"
+  # end_of_discharge_soc_entity: "number.batteries_end_of_discharge_soc"
 
   # ─── EV CHARGER [OPTIONAL] ─────────────────────────────────
   # If ON, night charging is skipped to avoid grid overload
