@@ -19,6 +19,13 @@
 #   - Telegram + Alexa notifications with unified DND
 #   - Fully configurable via apps.yaml (no hardcoded entities)
 #
+# Changelog v2.3.1:
+#   - FIX: a charge left on by a restart is really stopped (charge switch
+#     + inverter), not only its flag. Before, if the alert ended while
+#     AppDaemon was down, the forced charge stayed on
+#   - FIX: a night charge left on resumes its monitor when still inside
+#     the charge window, otherwise it is stopped
+#
 # Changelog v2.3:
 #   - Maintenance discharge adjustable from the dashboard
 #     (input_number.storm_shield_maintenance_discharge, default 2000W):
@@ -43,7 +50,7 @@ from datetime import datetime, timedelta, time
 
 class StormShield(hass.Hass):
 
-    VERSION = "2.3"
+    VERSION = "2.3.1"
 
     # ═════════════════════════════════════════════════════════════
     # INIT
@@ -183,10 +190,34 @@ class StormShield(hass.Hass):
             self.run_daily(self._f3_stop_cb, f3_end)
             self.log(f"  🌙 Night charge stop:  {f3_end.strftime('%H:%M')}")
 
-        # ─── Reset stale runtime flags (HA restores the last state,
-        #     but timers are lost on restart) ───
-        for entity in (self.h_charging, self.h_f3_charging,
-                       self.h_protection, self.h_blackout):
+        # ─── Clean up state left by a restart (HA restores the last
+        #     state, but AppDaemon timers and monitors are lost) ───
+        # An alert charge left on is really stopped (switch + inverter);
+        # the initial check restarts it if the alert is still active.
+        try:
+            if self.get_state(self.h_charging) == "on":
+                self.log("  🔄 Alert charge left on → stop (re-check in 10s)")
+                self._stop_charging()
+        except Exception as e:
+            self.log(f"⚠️ Reset alert charge: {e}", level="WARNING")
+
+        # A night charge left on resumes its monitor inside the window,
+        # otherwise it is stopped.
+        try:
+            if self.get_state(self.h_f3_charging) == "on":
+                if self._in_f3_window():
+                    self.log("  🔄 Night charge in progress → monitor resumed")
+                    self._cancel_f3_monitor()
+                    self.f3_monitor_timer = self.run_every(
+                        self._f3_monitor_cb,
+                        self.datetime() + timedelta(seconds=60), 60)
+                else:
+                    self.log("  🔄 Night charge outside its window → stop")
+                    self._f3_stop_charging()
+        except Exception as e:
+            self.log(f"⚠️ Reset night charge: {e}", level="WARNING")
+
+        for entity in (self.h_protection, self.h_blackout):
             try:
                 if self.get_state(entity) == "on":
                     self.call_service("input_boolean/turn_off",
@@ -286,6 +317,17 @@ class StormShield(hass.Hass):
     # ═════════════════════════════════════════════════════════════
     # UTILITY
     # ═════════════════════════════════════════════════════════════
+
+    def _in_f3_window(self):
+        """True if now is inside the night charge window."""
+        start = self._time_from("input_datetime.storm_shield_f3_start")
+        end = self._time_from("input_datetime.storm_shield_f3_end")
+        if not start or not end:
+            return False
+        now_t = self.datetime().time()
+        if start > end:  # window across midnight (e.g. 23:00-05:00)
+            return now_t >= start or now_t < end
+        return start <= now_t < end
 
     def _maintenance_w(self):
         """Maintenance discharge (W): dashboard helper, else apps.yaml."""

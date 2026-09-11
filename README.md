@@ -7,7 +7,7 @@ Storm Shield monitors Italian Civil Protection (DPC) weather alerts and automati
 ![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1+-blue?logo=home-assistant)
 ![AppDaemon](https://img.shields.io/badge/AppDaemon-4.4+-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
-![Version](https://img.shields.io/badge/version-2.3.0-informational)
+![Version](https://img.shields.io/badge/version-2.3.1-informational)
 
 ---
 <img width="1331" height="911" alt="Immagine 2026-02-13 120020" src="https://github.com/user-attachments/assets/b82fe22d-5400-401a-9368-deacce67f1c8" />
@@ -253,6 +253,10 @@ storm-shield/
 ```
 
 ## Changelog
+
+### 2.3.1
+- Fix: a charge left on by a restart is really stopped (charge switch + inverter), not only its flag. Before, if the alert ended while AppDaemon was down, the forced charge stayed on.
+- Fix: a night charge left on resumes its monitor when still inside the charge window, otherwise it is stopped.
 
 ### 2.3.0
 - Maintenance discharge adjustable from the dashboard (`storm_shield_maintenance_discharge`, default 2000W).
